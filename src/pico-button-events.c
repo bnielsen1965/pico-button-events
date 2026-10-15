@@ -35,6 +35,7 @@ static button_timing_t g_timing = {
     .debounce_ms = 30,
     .pressed_ms = 150,
     .clicked_ms = 150,
+    .chord_ms = 100,
 };
 
 void buttonGetTiming(button_timing_t *timing)
@@ -78,6 +79,23 @@ typedef struct
 
 static button_t buttons[BUTTON_MAX];
 
+// Chord groups: a set of consecutive buttons whose simultaneously-held members
+// form one chord (a bitmask). See buttonChordInit() in the header.
+typedef struct
+{
+    bool inited;
+    uint first_index; // first button index in the group
+    uint count;       // number of buttons in the group
+    button_chord_mode_t mode;
+    uint held_mask;      // buttons in the group currently down (settled)
+    uint chord_mask;     // [release] union of buttons down during this down period
+    bool dirty;          // [press] held set changed since the last settle emit
+    absolute_time_t settleUntil; // [press] settle deadline
+    button_chord_cb callback;
+} chord_group_t;
+
+static chord_group_t chord_groups[BUTTON_CHORD_MAX];
+
 // GPIO interrupt handler (runs on the core that called buttonInit).
 // Must stay tiny: only record that an edge occurred.
 static void buttonISR(uint gpio, uint32_t event_mask)
@@ -111,6 +129,28 @@ void buttonInit(uint button_index, uint gpio, button_event_cb callback)
     gpio_set_irq_enabled_with_callback(gpio,
                                        GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE,
                                        true, buttonISR);
+}
+
+void buttonChordInit(uint first_index, uint count, button_chord_cb callback,
+                     button_chord_mode_t mode)
+{
+    for (uint g = 0; g < BUTTON_CHORD_MAX; g++)
+    {
+        chord_group_t *cg = &chord_groups[g];
+        if (cg->inited)
+            continue;
+        cg->inited = true;
+        cg->first_index = first_index;
+        cg->count = count;
+        cg->mode = mode;
+        cg->held_mask = 0;
+        cg->chord_mask = 0;
+        cg->dirty = false;
+        cg->callback = callback;
+        return;
+    }
+    // No free group slot: the caller should ensure BUTTON_CHORD_MAX is large
+    // enough. (Consistent with buttonInit(), which also trusts its index.)
 }
 
 // Emit the event for the current state and make the state transition that
@@ -165,10 +205,66 @@ static void emitState(uint button_index, button_t *b)
         b->callback(button_index, event);
 }
 
+// Update a chord group on a settled (debounced) press/release. Both modes
+// track the held set; release mode accumulates a chord and emits it when the
+// last button is released, while press mode re-arms the settle window
+// (buttonTickAll() emits the held set once it is stable). Called from
+// processLevelChange(), so it is debounce-filtered and runs only on the
+// ticking core.
+static void updateChord(uint button_index, bool pressed)
+{
+    for (uint g = 0; g < BUTTON_CHORD_MAX; g++)
+    {
+        chord_group_t *cg = &chord_groups[g];
+        if (!cg->inited)
+            continue;
+        if (button_index < cg->first_index ||
+            button_index - cg->first_index >= cg->count)
+            continue; // this button is not in the group
+        uint bit = 1u << (button_index - cg->first_index);
+
+        // apply the settled level change to the held set (skip no-ops)
+        if (pressed)
+        {
+            if (cg->held_mask & bit)
+                continue;
+            cg->held_mask |= bit;
+        }
+        else
+        {
+            if (!(cg->held_mask & bit))
+                continue;
+            cg->held_mask &= ~bit;
+        }
+
+        if (cg->mode == BUTTON_CHORD_MODE_RELEASE)
+        {
+            // accumulate the chord; emit it when the last button is released
+            if (pressed)
+                cg->chord_mask |= bit;
+            if (cg->held_mask == 0 && cg->chord_mask && cg->callback)
+            {
+                cg->callback(cg->chord_mask);
+                cg->chord_mask = 0;
+            }
+        }
+        else // BUTTON_CHORD_MODE_PRESS
+        {
+            // (re)arm the settle window; buttonTickAll() emits when it expires
+            cg->dirty = true;
+            cg->settleUntil =
+                delayed_by_us(get_absolute_time(), (uint64_t)g_timing.chord_ms * 1000);
+        }
+    }
+}
+
 // State machine transition on a settled (debounced) press or release
 // (mirrors processLastValue() in the JS module).
 static void processLevelChange(button_t *b, bool pressed)
 {
+    // keep chord groups in step with the debounced press/release
+    updateChord((uint)(b - buttons), pressed);
+
     if (pressed)
     {
         switch (b->state)
@@ -275,6 +371,21 @@ void buttonTickAll(absolute_time_t now)
 
         if (b->hasPendingEvent && absolute_time_diff_us(b->emitAt, now) >= 0)
             emitState(i, b);
+    }
+
+    // settle press-mode chords: emit the current held set once it has been
+    // stable for the settle window and is non-empty
+    for (uint g = 0; g < BUTTON_CHORD_MAX; g++)
+    {
+        chord_group_t *cg = &chord_groups[g];
+        if (!cg->inited || cg->mode != BUTTON_CHORD_MODE_PRESS || !cg->dirty)
+            continue;
+        if (absolute_time_diff_us(cg->settleUntil, now) >= 0)
+        {
+            cg->dirty = false;
+            if (cg->held_mask && cg->callback)
+                cg->callback(cg->held_mask);
+        }
     }
 }
 

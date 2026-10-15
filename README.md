@@ -7,7 +7,8 @@ A C port of the JavaScript [button-events](https://github.com/bnielsen1965/butto
 ## Features
 
 - Click, double/triple/quadruple-click, long-press, and release events
-- Configurable debounce / long-press / multi-click-chaining windows (default 30 / 150 / 150 ms)
+- Chord events: group buttons so that simultaneously-held buttons emit one bitmask (1–F for 4 buttons), fired on press or on release
+- Configurable debounce / long-press / multi-click-chaining / chord-settle windows (default 30 / 150 / 150 / 100 ms)
 - ISR only records edges; all state-machine work happens in the tick, so the IRQ path stays tiny
 - Self-healing level resync: a missed edge re-syncs within one tick, so the machine can never get stuck out of step with the physical button
 - Up to 8 buttons per build (`BUTTON_MAX`)
@@ -68,8 +69,9 @@ int main(void)
 | Function | Description |
 | --- | --- |
 | `buttonInit(index, gpio, callback)` | Configure a button: input with internal pull-up, both-edge IRQ. Must run on the core that will call `buttonTickAll()`. |
+| `buttonChordInit(first, count, callback, mode)` | Group `count` consecutive buttons (from `first`) into a chord; `callback(mask)` fires the bitmask on release or press (`mode`). |
 | `buttonTickAll(now)` | Run the debounce + state machine and emit pending events. Call from **one** core, roughly every 20 ms. |
-| `buttonGetTiming(t)` / `buttonSetTiming(t)` | Get/set the timing windows (`debounce_ms`, `pressed_ms`, `clicked_ms`) for all buttons. Settable at runtime; call from the ticking core. |
+| `buttonGetTiming(t)` / `buttonSetTiming(t)` | Get/set the timing windows (`debounce_ms`, `pressed_ms`, `clicked_ms`, `chord_ms`). Settable at runtime; call from the ticking core. |
 | `buttonEventName(event)` | Human-readable name of an event, for logging. |
 
 ### Event semantics (mirrors the JS module)
@@ -77,6 +79,11 @@ int main(void)
 - Tap under `pressed_ms` → `clicked`. A new tap within `clicked_ms` of the release chains: `double_clicked`, `triple_clicked`; the fourth press emits `quadruple_clicked` immediately.
 - Hold past `pressed_ms` → `pressed` (long press); letting go emits `released`.
 - A click followed by a re-press while held emits the `*_PRESSED` variants.
+
+### Chord semantics
+
+- **Release mode** — buttons held together accumulate into one chord (bitmask); it is emitted when the last button is released. Buttons that overlap in time form one chord; a separate tap is its own.
+- **Press mode** — the current held set is emitted once it has been stable for `chord_ms`. It updates as buttons are added or removed while holding, and nothing is emitted for the empty set.
 
 ## Multi-core contract
 
@@ -86,9 +93,12 @@ Other cores/tasks that want button events should receive them out of the event c
 
 If the ticking core is busy (e.g. running a long command), events coalesce: a mash collapses to one settled transition. This matches the JS module's semantics, and the self-healing resync keeps the machine correct afterward.
 
-## Example
+## Examples
 
-See [`example/`](example/README.md) — four buttons on GPIO 10–13 printing every event.
+See [`example/`](example/README.md):
+
+- **four-buttons** — four buttons on GPIO 10–13 printing every event the state machine emits.
+- **chord** — hold buttons together to emit a single **chord**; each button is one bit, so a chord is a hex digit from 1 to F.
 
 ## Roadmap
 

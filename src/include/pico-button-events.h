@@ -18,6 +18,9 @@
 // Maximum number of buttons managed by the module
 #define BUTTON_MAX 8
 
+// Maximum number of simultaneous chord groups (see buttonChordInit)
+#define BUTTON_CHORD_MAX 4
+
 // Timing windows in milliseconds (mirrors the JS module's Config.timing:
 // debounce / pressed / clicked). Defaults are tuned for fast, natural
 // tapping: a tap held under ~150 ms is a click, holding past ~150 ms is
@@ -28,6 +31,7 @@ typedef struct
     uint32_t debounce_ms; // milliseconds to debounce the input
     uint32_t pressed_ms;  // hold time that becomes a "pressed" (long press)
     uint32_t clicked_ms;  // window in which a new tap chains into a multi-click
+    uint32_t chord_ms;    // settle window for press-mode chords (see below)
 } button_timing_t;
 
 // Get / set the timing windows (applies to all buttons; may be changed at
@@ -56,6 +60,34 @@ typedef void (*button_event_cb)(uint button_index, button_event_t event);
 // records that an edge occurred. Must be called on the core that will run
 // buttonTickAll (SIO GPIO IRQs are per-core).
 void buttonInit(uint button_index, uint gpio, button_event_cb callback);
+
+// ---- Chord detection -------------------------------------------------------
+// A chord group is a set of consecutive buttons treated as one unit: the
+// buttons held down together form a single chord, represented as a bitmask
+// (bit i = the (first_index + i)-th button in the group). For a group of 4
+// buttons the mask runs 0x1..0xF: a single tap is 0x1/0x2/0x4/0x8, two
+// buttons held together are 0x3/0x5/0x6/..., and all four are 0xF.
+//
+// When the chord fires depends on the mode (button_chord_mode_t):
+//   BUTTON_CHORD_MODE_RELEASE - when the group goes from "some down" back to
+//     "none down", i.e. when the last button is released.
+//   BUTTON_CHORD_MODE_PRESS   - once the pressed buttons have been stable for
+//     the chord_ms settle window; the mask is the buttons currently down.
+//
+// The callback is invoked (on the core that calls buttonTickAll) with the
+// mask. The group's buttons must be configured with buttonInit() first; a
+// NULL per-button callback is fine if you only want chord events.
+typedef void (*button_chord_cb)(uint mask);
+
+// When a chord group fires (see buttonChordInit)
+typedef enum
+{
+    BUTTON_CHORD_MODE_RELEASE = 0, // on the last button's release
+    BUTTON_CHORD_MODE_PRESS,       // once the pressed set is stable for chord_ms
+} button_chord_mode_t;
+
+void buttonChordInit(uint first_index, uint count, button_chord_cb callback,
+                     button_chord_mode_t mode);
 
 // Run the debounce + state machine and emit pending events. Call
 // periodically (roughly every 20 ms) from one core.
